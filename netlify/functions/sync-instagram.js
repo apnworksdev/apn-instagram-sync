@@ -67,6 +67,9 @@ export async function handler() {
           handle,
         },
         metaobject: {
+          capabilities: {
+            publishable: { status: "ACTIVE" },
+          },
           fields: [
             { key: "external_id", value: post.id },
             { key: "permalink", value: post.permalink },
