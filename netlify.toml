@@ -1,0 +1,8 @@
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Add later when sync is ready:
+# [[scheduled.functions]]
+#   name = "sync-instagram"
+#   schedule = "0 * * * *"
