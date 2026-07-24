@@ -1,5 +1,7 @@
 const SHOPIFY_API_VERSION = "2025-01";
 const METAOBJECT_TYPE = "instagram_post"; // must match your Shopify definition handle
+const FILE_READY_ATTEMPTS = 12;
+const FILE_READY_DELAY_MS = 1000;
 
 export async function handler() {
   try {
@@ -41,12 +43,19 @@ export async function handler() {
     // 2) Upsert each post into Shopify metaobjects
     for (let i = 0; i < posts.length; i++) {
       const post = posts[i];
-      const imageUrl = getImageUrl(post);
+      const temporaryImageUrl = getImageUrl(post);
 
-      if (!imageUrl || !post.permalink) continue;
+      if (!temporaryImageUrl || !post.permalink) continue;
 
       const handle = `post-${post.id}`; // unique handle per IG media id
       syncedIds.push(post.id);
+
+      let imageUrl = await getExistingDurableImageUrl(shop, adminToken, handle);
+
+      if (!imageUrl) {
+        const downloaded = await downloadInstagramImage(temporaryImageUrl, post.id);
+        imageUrl = await uploadImageToShopifyFiles(shop, adminToken, downloaded, post.caption || "");
+      }
 
       const result = await shopifyGraphql(shop, adminToken, `
         mutation UpsertInstagramPost($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
@@ -115,6 +124,185 @@ function getImageUrl(post) {
   if (post.media_type === "VIDEO") return post.thumbnail_url || post.media_url;
   if (post.media_type === "CAROUSEL_ALBUM") return post.media_url || post.thumbnail_url;
   return post.media_url || post.thumbnail_url;
+}
+
+function isDurableShopifyUrl(url) {
+  if (!url) return false;
+  return url.includes("cdn.shopify.com") || url.includes("/cdn/shop/");
+}
+
+function extensionFromMime(mimeType) {
+  if (mimeType.includes("png")) return "png";
+  if (mimeType.includes("webp")) return "webp";
+  if (mimeType.includes("gif")) return "gif";
+  return "jpg";
+}
+
+async function getExistingDurableImageUrl(shop, token, handle) {
+  const result = await shopifyGraphql(shop, token, `
+    query GetInstagramPost($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        field(key: "image_url") {
+          value
+        }
+      }
+    }
+  `, {
+    handle: {
+      type: METAOBJECT_TYPE,
+      handle,
+    },
+  });
+
+  const existingUrl = result.data?.metaobjectByHandle?.field?.value;
+  return isDurableShopifyUrl(existingUrl) ? existingUrl : null;
+}
+
+async function downloadInstagramImage(url, mediaId) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to download Instagram image ${mediaId}: ${res.status}`);
+  }
+
+  const mimeType = (res.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const filename = `instagram-${mediaId}.${extensionFromMime(mimeType)}`;
+
+  return { bytes, mimeType, filename };
+}
+
+async function uploadImageToShopifyFiles(shop, token, { bytes, mimeType, filename }, alt) {
+  const stagedResult = await shopifyGraphql(shop, token, `
+    mutation StageInstagramUpload($input: [StagedUploadInput!]!) {
+      stagedUploadsCreate(input: $input) {
+        stagedTargets {
+          url
+          resourceUrl
+          parameters {
+            name
+            value
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `, {
+    input: [
+      {
+        filename,
+        mimeType,
+        httpMethod: "POST",
+        resource: "FILE",
+      },
+    ],
+  });
+
+  const stagedErrors = stagedResult.data?.stagedUploadsCreate?.userErrors || [];
+  if (stagedErrors.length) {
+    throw new Error(`stagedUploadsCreate errors: ${JSON.stringify(stagedErrors)}`);
+  }
+
+  const target = stagedResult.data?.stagedUploadsCreate?.stagedTargets?.[0];
+  if (!target?.url || !target?.resourceUrl) {
+    throw new Error("stagedUploadsCreate did not return an upload target.");
+  }
+
+  const form = new FormData();
+  for (const param of target.parameters || []) {
+    form.append(param.name, param.value);
+  }
+  form.append("file", new Blob([bytes], { type: mimeType }), filename);
+
+  const uploadRes = await fetch(target.url, {
+    method: "POST",
+    body: form,
+  });
+
+  if (!uploadRes.ok) {
+    const body = await uploadRes.text();
+    throw new Error(`Staged upload POST failed (${uploadRes.status}): ${body}`);
+  }
+
+  const createResult = await shopifyGraphql(shop, token, `
+    mutation CreateInstagramFile($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files {
+          id
+          fileStatus
+          ... on MediaImage {
+            image {
+              url
+            }
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `, {
+    files: [
+      {
+        originalSource: target.resourceUrl,
+        contentType: "IMAGE",
+        alt: alt.slice(0, 512),
+      },
+    ],
+  });
+
+  const createErrors = createResult.data?.fileCreate?.userErrors || [];
+  if (createErrors.length) {
+    throw new Error(`fileCreate errors: ${JSON.stringify(createErrors)}`);
+  }
+
+  const file = createResult.data?.fileCreate?.files?.[0];
+  if (!file?.id) {
+    throw new Error("fileCreate did not return a file id.");
+  }
+
+  if (file.image?.url) {
+    return file.image.url;
+  }
+
+  return waitForShopifyFileUrl(shop, token, file.id);
+}
+
+async function waitForShopifyFileUrl(shop, token, fileId) {
+  for (let attempt = 0; attempt < FILE_READY_ATTEMPTS; attempt++) {
+    await sleep(FILE_READY_DELAY_MS);
+
+    const result = await shopifyGraphql(shop, token, `
+      query FileReady($id: ID!) {
+        node(id: $id) {
+          ... on MediaImage {
+            fileStatus
+            image {
+              url
+            }
+          }
+        }
+      }
+    `, { id: fileId });
+
+    const node = result.data?.node;
+    if (node?.fileStatus === "FAILED") {
+      throw new Error(`Shopify file processing failed for ${fileId}`);
+    }
+
+    if (node?.image?.url) {
+      return node.image.url;
+    }
+  }
+
+  throw new Error(`Timed out waiting for Shopify file URL: ${fileId}`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function shopifyGraphql(shop, token, query, variables) {
