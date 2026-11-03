@@ -4,5 +4,8 @@
   "type": "module",
   "devDependencies": {
     "netlify-cli": "^26.2.0"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^11.1.7"
   }
 }

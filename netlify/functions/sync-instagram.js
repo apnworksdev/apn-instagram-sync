@@ -1,16 +1,24 @@
+import { getInstagramToken, notifyFailure } from "../lib/instagram-token.js";
+
 const SHOPIFY_API_VERSION = "2025-01";
 const METAOBJECT_TYPE = "instagram_post"; // must match your Shopify definition handle
 const FILE_READY_ATTEMPTS = 12;
 const FILE_READY_DELAY_MS = 1000;
 
-export async function handler() {
+// v2 function format (needed for Netlify Blobs). Keep the hourly schedule
+// where it is today (netlify.toml); don't add a second one here.
+export default async () => {
   try {
-    const igToken = process.env.INSTAGRAM_ACCESS_TOKEN;
+    const stored = await getInstagramToken(); // Blobs first, then INSTAGRAM_ACCESS_TOKEN env as fallback
+    const igToken = stored?.access_token;
     const shop = process.env.SHOPIFY_STORE_DOMAIN;
     const adminToken = process.env.SHOPIFY_ADMIN_TOKEN;
     const limit = Number(process.env.INSTAGRAM_POST_LIMIT || 6);
 
-    if (!igToken || !shop || !adminToken) {
+    if (!igToken) {
+      throw new Error("No Instagram token stored. Reconnect via /.netlify/functions/instagram-auth.");
+    }
+    if (!shop || !adminToken) {
       throw new Error("Missing required environment variables.");
     }
 
@@ -100,25 +108,19 @@ export async function handler() {
     // 3) Optional cleanup: remove old posts no longer in latest fetch
     await cleanupStalePosts(shop, adminToken, syncedIds);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        ok: true,
-        syncedCount: syncedIds.length,
-        syncedIds,
-      }),
-    };
+    return new Response(
+      JSON.stringify({ ok: true, syncedCount: syncedIds.length, syncedIds }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
   } catch (error) {
     console.error(error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({
-        ok: false,
-        error: error.message,
-      }),
-    };
+    await notifyFailure(`Instagram sync failed: ${error.message}`);
+    return new Response(
+      JSON.stringify({ ok: false, error: error.message }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
-}
+};
 
 function getImageUrl(post) {
   if (post.media_type === "VIDEO") return post.thumbnail_url || post.media_url;
