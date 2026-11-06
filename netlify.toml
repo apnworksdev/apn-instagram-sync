@@ -2,6 +2,7 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
-[[scheduled.functions]]
-  name = "sync-instagram"
-  schedule = "0 * * * *"
+# Hourly Instagram → Shopify sync. The name must match the function file.
+# [[scheduled.functions]] is not a Netlify key, so the old block never registered.
+[functions."sync-instagram"]
+  schedule = "@hourly"
